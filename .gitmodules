@@ -1,0 +1,3 @@
+[submodule "lib/wyltek-embedded-builder"]
+	path = lib/wyltek-embedded-builder
+	url = https://github.com/toastmanAu/wyltek-embedded-builder.git

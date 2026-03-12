@@ -1,142 +1,182 @@
 /**
  * FiberQuest HMI — main.cpp
+ * Guition ESP32-S3-4848S040 (WEB target)
  *
- * Hardware: Guition ESP32-S3-4848S040
- *   - 480×480 ST7701S RGB parallel display
- *   - GT911 capacitive touch
- *   - 16MB flash, 8MB OPI PSRAM
+ * Uses wyltek-embedded-builder (WEB) for:
+ *   - WyDisplay  — ST7701S 480×480 RGB init
+ *   - WyTouch    — GT911 I2C capacitive touch
+ *   - WySettings — NVS + captive portal WiFi provisioning
+ *   - WyNet      — WiFi connect / reconnect / mDNS
  *
- * UI framework: LVGL v8
- *
- * Role: Physical arcade-style control surface for FiberQuest tournaments.
- *   - Browse & join tournaments (QR entry or WiFi-direct)
- *   - Live score display (scores pushed from Node.js agent via WebSocket)
- *   - Fiber channel status + balance
- *   - Winner celebration screen
+ * After WiFi: connects to FiberQuest Pi agent via WebSocket
+ * and renders live game state on LVGL screens.
  */
 
 #include <Arduino.h>
-#include <WiFi.h>
+
+// ── WEB board support ─────────────────────────────────────────────
+#include "wyltek-embedded-builder/src/boards.h"
+#include "wyltek-embedded-builder/src/display/WyDisplay.h"
+#include "wyltek-embedded-builder/src/touch/WyTouch.h"
+#include "wyltek-embedded-builder/src/settings/WySettings.h"
+#include "wyltek-embedded-builder/src/net/WyNet.h"
+
+// ── LVGL ──────────────────────────────────────────────────────────
 #include <lvgl.h>
-#include <Arduino_GFX_Library.h>
-#include <GT911.h>
-#include <Wire.h>
+#include "lv_conf.h"
 
-#include "pins.h"
-#include "ui/screens.h"
+// ── App ───────────────────────────────────────────────────────────
 #include "net/ws_client.h"
-#include "net/wifi_setup.h"
+#include "ui/screens.h"
 
-// ── Display setup ────────────────────────────────────────────────────
-Arduino_ESP32RGBPanel *rgbBus = new Arduino_ESP32RGBPanel(
-    PIN_RGB_DE, PIN_RGB_VSYNC, PIN_RGB_HSYNC, PIN_RGB_PCLK,
-    PIN_RGB_R0, PIN_RGB_R1, PIN_RGB_R2, PIN_RGB_R3, PIN_RGB_R4,
-    PIN_RGB_G0, PIN_RGB_G1, PIN_RGB_G2, PIN_RGB_G3, PIN_RGB_G4, PIN_RGB_G5,
-    PIN_RGB_B0, PIN_RGB_B1, PIN_RGB_B2, PIN_RGB_B3, PIN_RGB_B4);
+// ── Globals ───────────────────────────────────────────────────────
+static WyDisplay   wyDisplay;
+static WyTouch     wyTouch;
+static WySettings  wySettings;
+static WyNet       wyNet;
 
-Arduino_ST7701_RGBPanel *gfx = new Arduino_ST7701_RGBPanel(
-    rgbBus, GFX_NOT_DEFINED, 0, true,
-    DISPLAY_W, DISPLAY_H,
-    st7701_type1_init_operations, sizeof(st7701_type1_init_operations), true,
-    10, 8, 50, 10, 8, 20);
+// LVGL draw buffer — in PSRAM
+static lv_color_t  *lv_buf1 = nullptr;
+static lv_color_t  *lv_buf2 = nullptr;
+static lv_disp_draw_buf_t draw_buf;
+static lv_disp_drv_t      disp_drv;
+static lv_indev_drv_t     indev_drv;
 
-// ── LVGL draw buffer (in PSRAM) ───────────────────────────────────────
-static lv_disp_draw_buf_t drawBuf;
-static lv_color_t *buf1;
-static lv_color_t *buf2;
-static const size_t BUF_LINES = 20;
-
-static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p) {
-    uint32_t w = area->x2 - area->x1 + 1;
-    uint32_t h = area->y2 - area->y1 + 1;
-    gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)color_p, w, h);
+// ── LVGL display flush ────────────────────────────────────────────
+static void lv_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p) {
+    auto *gfx = (Arduino_GFX *)drv->user_data;
+    uint32_t w = (area->x2 - area->x1 + 1);
+    uint32_t h = (area->y2 - area->y1 + 1);
+    gfx->draw16bitBeRGBBitmap(area->x1, area->y1, (uint16_t *)color_p, w, h);
     lv_disp_flush_ready(drv);
 }
 
-// ── GT911 touch ───────────────────────────────────────────────────────
-GT911 touch;
-
-static void lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
-    GTPoint p;
-    int n = touch.readTouchPoints(&p, 1);
-    if (n > 0) {
+// ── LVGL touch read ───────────────────────────────────────────────
+static void lv_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
+    auto *touch = (WyTouch *)drv->user_data;
+    uint16_t tx, ty;
+    if (touch->read(tx, ty)) {
         data->state   = LV_INDEV_STATE_PR;
-        data->point.x = p.x;
-        data->point.y = p.y;
+        data->point.x = tx;
+        data->point.y = ty;
     } else {
         data->state = LV_INDEV_STATE_REL;
     }
 }
 
-// ── LVGL tick (ISR-safe) ──────────────────────────────────────────────
-static void IRAM_ATTR lv_tick_isr(void *arg) {
-    lv_tick_inc(1);
-}
+// ── LVGL tick (hardware timer) ────────────────────────────────────
+static hw_timer_t *lvgl_timer = nullptr;
+static void IRAM_ATTR lv_tick_isr() { lv_tick_inc(5); }
 
-// ─────────────────────────────────────────────────────────────────────
+// ── Setup ─────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    Serial.println("[FQH] FiberQuest HMI booting...");
+    delay(200);
+    Serial.println("\n[FiberQuest HMI] boot");
 
-    // Backlight on
-    pinMode(PIN_BL, OUTPUT);
-    digitalWrite(PIN_BL, HIGH);
+    // ── Display ────────────────────────────────────────────────────
+    wyDisplay.begin();
+    wyDisplay.setBrightness(200);
 
-    // Init display
-    gfx->begin();
-    gfx->fillScreen(BLACK);
-    Serial.println("[FQH] Display OK");
+    // ── Touch ──────────────────────────────────────────────────────
+    wyTouch.begin();
 
-    // Init PSRAM buffers
-    buf1 = (lv_color_t *)ps_malloc(DISPLAY_W * BUF_LINES * sizeof(lv_color_t));
-    buf2 = (lv_color_t *)ps_malloc(DISPLAY_W * BUF_LINES * sizeof(lv_color_t));
-    if (!buf1 || !buf2) {
-        Serial.println("[FQH] PSRAM alloc failed!");
-        while(1) delay(1000);
+    // ── LVGL ───────────────────────────────────────────────────────
+    lv_init();
+
+    // Allocate draw buffers from PSRAM
+    size_t buf_sz = WY_SCREEN_W * 40;  // 40 lines
+    lv_buf1 = (lv_color_t *)heap_caps_malloc(buf_sz * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    lv_buf2 = (lv_color_t *)heap_caps_malloc(buf_sz * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    if (!lv_buf1 || !lv_buf2) {
+        Serial.println("[LVGL] PSRAM alloc failed — falling back to internal RAM");
+        lv_buf1 = (lv_color_t *)malloc(buf_sz * sizeof(lv_color_t));
+        lv_buf2 = (lv_color_t *)malloc(buf_sz / 2 * sizeof(lv_color_t));
+    }
+    lv_disp_draw_buf_init(&draw_buf, lv_buf1, lv_buf2, buf_sz);
+
+    // Register display driver
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.hor_res    = WY_SCREEN_W;
+    disp_drv.ver_res    = WY_SCREEN_H;
+    disp_drv.flush_cb   = lv_flush_cb;
+    disp_drv.draw_buf   = &draw_buf;
+    disp_drv.user_data  = wyDisplay.gfx;
+    lv_disp_drv_register(&disp_drv);
+
+    // Register touch input driver
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type      = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb   = lv_touch_cb;
+    indev_drv.user_data = &wyTouch;
+    lv_indev_drv_register(&indev_drv);
+
+    // Hardware timer for LVGL tick (5ms)
+    lvgl_timer = timerBegin(0, 80, true);
+    timerAttachInterrupt(lvgl_timer, lv_tick_isr, true);
+    timerAlarmWrite(lvgl_timer, 5000, true);
+    timerAlarmEnable(lvgl_timer);
+
+    // ── UI: show splash while connecting ───────────────────────────
+    ui_init();
+    lv_task_handler();
+
+    // ── Settings / WiFi provisioning ──────────────────────────────
+    wySettings.addString("ssid",       "WiFi SSID",       "");
+    wySettings.addString("pass",       "WiFi Password",   "");
+    wySettings.addString("agent_host", "Agent Host/IP",   "fiberquest.local");
+    wySettings.addInt   ("agent_port", "Agent WS Port",   8765);
+
+    wySettings.begin("fiberquest");
+
+    if (wySettings.portalActive()) {
+        // First boot or BOOT button held — show captive portal
+        Serial.println("[Settings] Portal active — connect to WY-Setup-XXXX AP");
+        while (wySettings.portalActive()) {
+            wySettings.portalLoop();
+            lv_task_handler();
+        }
+        Serial.println("[Settings] Saved — restarting");
+        delay(500);
+        ESP.restart();
     }
 
-    // Init LVGL
-    lv_init();
-    lv_disp_draw_buf_init(&drawBuf, buf1, buf2, DISPLAY_W * BUF_LINES);
+    const char *ssid   = wySettings.getString("ssid");
+    const char *pass   = wySettings.getString("pass");
+    const char *ahost  = wySettings.getString("agent_host");
+    int         aport  = wySettings.getInt("agent_port");
 
-    static lv_disp_drv_t dispDrv;
-    lv_disp_drv_init(&dispDrv);
-    dispDrv.hor_res   = DISPLAY_W;
-    dispDrv.ver_res   = DISPLAY_H;
-    dispDrv.flush_cb  = lvgl_flush_cb;
-    dispDrv.draw_buf  = &drawBuf;
-    lv_disp_drv_register(&dispDrv);
-    Serial.println("[FQH] LVGL display driver registered");
+    if (!ssid || strlen(ssid) == 0) {
+        Serial.println("[WiFi] No SSID — entering portal");
+        wySettings.startPortal();
+        while (wySettings.portalActive()) {
+            wySettings.portalLoop();
+            lv_task_handler();
+        }
+        ESP.restart();
+    }
 
-    // Init GT911 touch
-    Wire.begin(PIN_TOUCH_SDA, PIN_TOUCH_SCL);
-    touch.begin(PIN_TOUCH_RST, PIN_TOUCH_INT, GT911_ADDR);
-    Serial.println("[FQH] Touch OK");
+    // ── Connect to WiFi ────────────────────────────────────────────
+    wyNet.setHostname("fiberquest-hmi");
+    wyNet.onConnect([ahost, aport]() {
+        Serial.printf("[WiFi] Connected. Connecting to agent ws://%s:%d\n", ahost, aport);
+        ws_client_set_host(ahost, (uint16_t)aport);
+        ws_client_begin();
+        ui_show_home();
+    });
+    wyNet.onDisconnect([]() {
+        Serial.println("[WiFi] Disconnected");
+        ui_live_set_status("WiFi lost...");
+    });
+    wyNet.begin(ssid, pass);
 
-    static lv_indev_drv_t indevDrv;
-    lv_indev_drv_init(&indevDrv);
-    indevDrv.type     = LV_INDEV_TYPE_POINTER;
-    indevDrv.read_cb  = lvgl_touch_cb;
-    lv_indev_drv_register(&indevDrv);
-
-    // LVGL tick timer (1ms via ESP32 hw timer)
-    esp_timer_handle_t tickTimer;
-    esp_timer_create_args_t timerArgs = {
-        .callback = lv_tick_isr,
-        .name     = "lv_tick"
-    };
-    esp_timer_create(&timerArgs, &tickTimer);
-    esp_timer_start_periodic(tickTimer, 1000); // 1ms
-
-    // Show splash → WiFi setup screen
-    ui_init();
-    wifi_setup_begin();
-
-    Serial.println("[FQH] Boot complete");
+    Serial.println("[Setup] done");
 }
 
+// ── Loop ──────────────────────────────────────────────────────────
 void loop() {
-    lv_task_handler();
-    ws_client_loop();
-    delay(2);
+    wyNet.loop();          // reconnect watchdog + OTA
+    ws_client_loop();      // WebSocket event pump
+    lv_task_handler();     // LVGL render
+    delay(5);
 }
